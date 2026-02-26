@@ -4,7 +4,7 @@
 # Slight differences in processing chat messages
 import datetime
 from collections.abc import Iterable
-from typing import Literal, Optional, Union
+from typing import TYPE_CHECKING, Literal, Optional, Union
 
 import orjson
 from openai.types.responses import (
@@ -24,6 +24,9 @@ from openai.types.responses.response_reasoning_item import (
     Content as ResponseReasoningTextContent,
 )
 from openai.types.responses.tool import Tool
+
+if TYPE_CHECKING:
+    from sglang.srt.entrypoints.openai.protocol import ResponseTool
 from openai_harmony import (
     Author,
     Conversation,
@@ -84,7 +87,8 @@ def get_system_message(
 
 
 def get_developer_message(
-    instructions: Optional[str] = None, tools: Optional[list[Tool]] = None
+    instructions: Optional[str] = None,
+    tools: Optional[Union[list[Tool], list["ResponseTool"]]] = None,
 ) -> Message:
     dev_msg_content = DeveloperContent.new()
     if instructions is not None:
@@ -100,14 +104,25 @@ def get_developer_message(
             else:
                 raise ValueError(f"tool type {tool.type} not supported")
         if function_tools:
-            function_tool_descriptions = [
-                ToolDescription.new(
-                    name=tool.name,
-                    description=tool.description,
-                    parameters=tool.parameters,
+            function_tool_descriptions = []
+            for tool in function_tools:
+                if hasattr(tool, "function"):
+                    # openai.Tool structure
+                    name = tool.function.name
+                    description = tool.function.description
+                    parameters = tool.function.parameters
+                else:
+                    # ResponseFunctionTool structure
+                    name = tool.name
+                    description = tool.description
+                    parameters = tool.parameters
+                function_tool_descriptions.append(
+                    ToolDescription.new(
+                        name=name,
+                        description=description,
+                        parameters=parameters,
+                    )
                 )
-                for tool in function_tools
-            ]
             dev_msg_content = dev_msg_content.with_function_tools(
                 function_tool_descriptions
             )
@@ -117,6 +132,19 @@ def get_developer_message(
 
 def get_user_message(content: str) -> Message:
     return Message.from_role_and_content(Role.USER, content)
+
+
+def _extract_text(content_part: dict) -> str:
+    """Extract text from a Responses API content part.
+
+    The OpenAI Responses API uses ``type: "input_text"`` with a ``text``
+    field, while the Chat Completions API uses ``type: "text"``. This
+    helper normalizes both formats so callers can always read the text.
+    """
+    part_type = content_part.get("type", "")
+    if part_type in ("text", "input_text"):
+        return content_part.get("text", "")
+    return ""
 
 
 def parse_response_input(
@@ -139,7 +167,9 @@ def parse_response_input(
         if isinstance(content, str):
             msg = Message.from_role_and_content(role, text_prefix + content)
         else:
-            contents = [TextContent(text=text_prefix + c["text"]) for c in content]
+            contents = [
+                TextContent(text=text_prefix + _extract_text(c)) for c in content
+            ]
             msg = Message.from_role_and_contents(role, contents)
     elif response_msg["type"] == "function_call_output":
         call_id = response_msg["call_id"]

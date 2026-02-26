@@ -48,14 +48,17 @@ from sglang.srt.entrypoints.harmony_utils import (
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageParam,
     ChatCompletionRequest,
+    Function,
     PromptTokenUsageInfo,
     RequestResponseMetadata,
     ResponsesRequest,
     ResponsesResponse,
+    Tool,
     UsageInfo,
 )
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
+from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils import random_uuid
@@ -65,6 +68,36 @@ if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_responses_input(
+    input_items: list,
+) -> list[ChatCompletionMessageParam]:
+    """Normalize Responses API input messages to Chat Completions format.
+
+    The OpenAI Responses API uses ``type: "input_text"`` for text content
+    parts, while the Chat Completions API uses ``type: "text"``. This
+    function converts between the two so the downstream chat pipeline
+    receives the format it expects.
+    """
+    messages: list[ChatCompletionMessageParam] = []
+    for item in input_items:
+        if isinstance(item, dict):
+            item = dict(item)  # shallow copy
+            content = item.get("content")
+            if isinstance(content, list):
+                item["content"] = [_normalize_content_part(part) for part in content]
+            messages.append(item)  # type: ignore[arg-type]
+        else:
+            messages.append(item)  # type: ignore[arg-type]
+    return messages
+
+
+def _normalize_content_part(part: dict) -> dict:
+    """Convert a Responses API content part to Chat Completions format."""
+    if isinstance(part, dict) and part.get("type") == "input_text":
+        return {"type": "text", "text": part.get("text", "")}
+    return part
 
 
 class OpenAIServingResponses(OpenAIServingChat):
@@ -376,6 +409,25 @@ class OpenAIServingResponses(OpenAIServingChat):
         # Construct the input messages
         messages = self._construct_input_messages(request, prev_response)
 
+        # Convert ResponseTool (flat) to Tool (nested) format for ChatCompletionRequest
+        chat_tools: Optional[list[Tool]] = None
+        if request.tools:
+            function_tools = [
+                Tool(
+                    type="function",
+                    function=Function(
+                        name=tool.name,
+                        description=tool.description,
+                        parameters=tool.parameters,
+                        strict=tool.strict,
+                    ),
+                )
+                for tool in request.tools
+                if tool.type == "function"
+            ]
+            if function_tools:
+                chat_tools = function_tools
+
         # Follow SGLang's pattern: create a ChatCompletionRequest and process messages
         try:
             # Convert ResponsesRequest to ChatCompletionRequest for processing
@@ -383,6 +435,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                 model=request.model,
                 messages=messages,
                 stream=request.stream,
+                tools=chat_tools,
+                tool_choice=request.tool_choice,
             )
 
             # Follow SGLang's _process_messages pattern
@@ -554,6 +608,52 @@ class OpenAIServingResponses(OpenAIServingChat):
                 status=None,
             )
             output_items.append(reasoning_item)
+
+        # Handle tool call parsing if enabled
+        tool_call_parser = getattr(
+            self.tokenizer_manager.server_args, "tool_call_parser", None
+        )
+        if (
+            tool_call_parser
+            and request.tools
+            and request.tool_choice != "none"
+            and content
+        ):
+            # Convert ResponseTool to Tool format for the parser
+            tools_for_parser = []
+            for tool in request.tools:
+                if tool.type == "function":
+                    tools_for_parser.append(
+                        Tool(
+                            type="function",
+                            function=Function(
+                                name=tool.name,
+                                description=tool.description,
+                                parameters=tool.parameters,
+                                strict=tool.strict,
+                            ),
+                        )
+                    )
+            if tools_for_parser:
+                parser = FunctionCallParser(tools_for_parser, tool_call_parser)
+                if parser.has_tool_call(content):
+                    try:
+                        remaining_text, call_info_list = parser.parse_non_stream(
+                            content
+                        )
+                        for call_info in call_info_list:
+                            tool_call_item = ResponseFunctionToolCall(
+                                id=f"fc_{random_uuid()}",
+                                call_id=f"call_{random_uuid()}",
+                                type="function_call",
+                                name=call_info.name,
+                                arguments=call_info.parameters,
+                            )
+                            output_items.append(tool_call_item)
+                        content = remaining_text
+                    except Exception as e:
+                        logger.warning(f"Tool call parsing failed: {e}")
+
         if content:
             output_text = ResponseOutputText(
                 text=content,
@@ -623,7 +723,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         if isinstance(request.input, str):
             messages.append({"role": "user", "content": request.input})
         else:
-            messages.extend(request.input)  # type: ignore
+            messages.extend(_normalize_responses_input(request.input))  # type: ignore
         return messages
 
     def _construct_input_messages_with_harmony(
@@ -692,7 +792,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             messages.append(get_user_message(request.input))
         else:
             if prev_response is not None:
-                prev_outputs = copy(prev_response.output)
+                prev_outputs = copy.copy(prev_response.output)
             else:
                 prev_outputs = []
             for response_msg in request.input:
