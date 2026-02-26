@@ -385,6 +385,8 @@ def set_torch_compile_config():
 
 def get_batch_sizes_to_capture(model_runner: ModelRunner, num_tokens_per_bs=1):
     server_args = model_runner.server_args
+    if num_tokens_per_bs is None:
+        num_tokens_per_bs = 1
     capture_bs = server_args.cuda_graph_bs
 
     if max(capture_bs) > model_runner.req_to_token_pool.size:
@@ -482,7 +484,7 @@ class CudaGraphRunner:
             else:
                 self.capture_forward_mode = ForwardMode.TARGET_VERIFY
                 self.num_tokens_per_bs = (
-                    self.model_runner.server_args.speculative_num_draft_tokens
+                    self.model_runner.server_args.speculative_num_draft_tokens or 1
                 )
         elif self.is_dllm:
             self.capture_forward_mode = ForwardMode.DLLM_EXTEND
@@ -1106,7 +1108,7 @@ class CudaGraphRunner:
                     retrive_cum_len=None,
                     spec_steps=self.model_runner.server_args.speculative_num_steps,
                     topk=self.model_runner.server_args.speculative_eagle_topk,
-                    draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
+                    draft_token_num=self.num_tokens_per_bs,
                     capture_hidden_mode=CaptureHiddenMode.FULL,
                     seq_lens_sum=None,
                     seq_lens_cpu=None,
