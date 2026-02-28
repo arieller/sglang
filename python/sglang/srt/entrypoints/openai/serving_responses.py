@@ -746,6 +746,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 "code_interpreter" in tool_types and self.tool_server is not None
             )
             sys_msg = get_system_message(
+                model_identity=request.model_identity,
                 reasoning_effort=reasoning_effort,
                 browser_description=(
                     self.tool_server.get_tool_description("browser")

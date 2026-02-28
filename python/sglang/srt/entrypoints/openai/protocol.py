@@ -1189,6 +1189,9 @@ class ResponsesRequest(BaseModel):
     truncation: Optional[Literal["auto", "disabled"]] = "disabled"
     user: Optional[str] = None
 
+    # Identity passed to the chat template's model_identity kwarg.
+    model_identity: Optional[str] = None
+
     # Extra SGLang parameters
     request_id: str = Field(
         default_factory=lambda: f"resp_{uuid.uuid4().hex}",
