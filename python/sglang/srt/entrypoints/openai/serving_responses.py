@@ -764,8 +764,32 @@ class OpenAIServingResponses(OpenAIServingChat):
             messages.append(dev_msg)
         else:
             # Continue the previous conversation.
-            # FIXME: Currently, request params like reasoning and
-            # instructions are ignored.
+            # Rebuild the system message so that changes to reasoning_effort or
+            # model_identity take effect on every turn.
+            reasoning_effort = request.reasoning.effort if request.reasoning else None
+            tool_types = [tool.type for tool in request.tools]
+            enable_browser = (
+                "web_search_preview" in tool_types and self.tool_server is not None
+            )
+            enable_code_interpreter = (
+                "code_interpreter" in tool_types and self.tool_server is not None
+            )
+            sys_msg = get_system_message(
+                model_identity=request.model_identity,
+                reasoning_effort=reasoning_effort,
+                browser_description=(
+                    self.tool_server.get_tool_description("browser")
+                    if self.tool_server and enable_browser
+                    else None
+                ),
+                python_description=(
+                    self.tool_server.get_tool_description("python")
+                    if self.tool_server and enable_code_interpreter
+                    else None
+                ),
+            )
+            messages.append(sys_msg)
+
             prev_msgs = self.msg_store[prev_response.id]
             # Remove the previous chain-of-thoughts if there is a new "final"
             # message.
@@ -789,7 +813,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                         hasattr(msg, "channel") and msg.channel != "analysis"
                     ):  # type: ignore[union-attr]
                         prev_msgs.append(msg)
-            messages.extend(prev_msgs)
+            # Skip the stale system message at index 0 — we just rebuilt it above.
+            messages.extend(prev_msgs[1:])
         # Append the new input.
         # Responses API supports simple text inputs without chat format.
         if isinstance(request.input, str):
